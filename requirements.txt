@@ -1,5 +1,6 @@
 fastapi>=0.110
-uvicorn>=0.29
+uvicorn
 sounddevice>=0.4.6
 numpy>=1.24
 cryptography>=42.0
+webrtcvad-wheels>=2.0.14

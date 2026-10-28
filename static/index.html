@@ -9,20 +9,29 @@
 <style>
   body { font-family: system-ui, sans-serif; background:#111; color:#eee;
          display:flex; flex-direction:column; align-items:center;
-         justify-content:center; min-height:100vh; margin:0; text-align:center;
+         min-height:100vh; margin:0; text-align:center;
          padding:1rem; box-sizing:border-box; }
   h1 { font-size:1.3rem; font-weight:600; margin:.2rem 0; }
-  button { font-size:1.15rem; padding:1rem 2rem; border-radius:999px;
+  .row { display:flex; gap:.7rem; align-items:center; margin-top:1rem; }
+  button { font-size:1.1rem; padding:.9rem 1.5rem; border-radius:999px;
            border:none; background:#4f9; color:#111; font-weight:700;
-           cursor:pointer; transition: background .2s; margin-top:1rem; }
+           cursor:pointer; transition: background .2s; }
   button:disabled { opacity:.4; cursor:default; }
   button.stop { background:#f66; }
+  button.mute { font-size:1.4rem; padding:.9rem 1.1rem; background:#333;
+                color:#eee; }
+  button.mute.muted { background:#f66; color:#111; }
   #status { margin-top:1rem; opacity:.8; }
   #vu { width:80%; max-width:340px; height:12px; background:#222;
         border-radius:6px; overflow:hidden; margin-top:1.5rem; }
   #vu > div { height:100%; width:0%; background:#4f9;
               transition: width 60ms linear; }
+  #vu > div.muted { background:#666; }
   #stats { margin-top:.6rem; font-size:.72rem; opacity:.55; font-family:monospace; }
+  .slider-row { margin-top:1rem; width:100%; max-width:340px;
+                display:flex; gap:.7rem; align-items:center; }
+  .slider-row label { font-size:.85rem; opacity:.7; white-space:nowrap; }
+  input[type=range] { flex:1; }
   details { margin-top:1.4rem; width:100%; max-width:340px;
             background:#1a1a1a; border-radius:12px; padding:.6rem .9rem;
             text-align:left; font-size:.85rem; }
@@ -36,7 +45,18 @@
 </head>
 <body>
   <h1>🎤 Micrófono remoto</h1>
-  <button id="start">Activar micrófono</button>
+
+  <div class="row">
+    <button id="start">Activar micrófono</button>
+    <button id="mute" class="mute" title="Silenciar" disabled>🔊</button>
+  </div>
+
+  <div class="slider-row">
+    <label>Ganancia</label>
+    <input id="gain" type="range" min="0" max="200" value="100" disabled>
+    <span id="gainVal" style="font-family:monospace;font-size:.8rem;width:3.5em;text-align:right">100%</span>
+  </div>
+
   <div id="status">Desconectado</div>
   <div id="vu"><div></div></div>
   <div id="stats"></div>
@@ -44,12 +64,13 @@
 
   <details>
     <summary>⚙️ Ajustes de audio</summary>
+    <label><input type="checkbox" id="optVAD" checked> VAD (solo enviar cuando hay voz)</label>
     <label><input type="checkbox" id="optNS"> Supresión de ruido (navegador)</label>
     <label><input type="checkbox" id="optAGC"> Ganancia automática (navegador)</label>
     <label><input type="checkbox" id="optEC"> Cancelación de eco (navegador)</label>
     <div style="opacity:.5;font-size:.75rem;margin-top:.5rem">
-      Todos desactivados por defecto. Si tu voz suena metálica o granulada,
-      déjalos así. Si tienes mucho ruido de fondo, prueba activar solo "Supresión".
+      VAD se puede cambiar en caliente. Los ajustes del navegador se aplican al
+      activar el micrófono (desactiva y reactiva para aplicarlos).
     </div>
   </details>
 
@@ -57,10 +78,14 @@
 
 <script>
 const btn       = document.getElementById('start');
+const muteBtn   = document.getElementById('mute');
+const gainSlider= document.getElementById('gain');
+const gainVal   = document.getElementById('gainVal');
 const statusEl  = document.getElementById('status');
 const vu        = document.querySelector('#vu > div');
 const statsEl   = document.getElementById('stats');
 const warnEl    = document.getElementById('warn');
+const optVAD    = document.getElementById('optVAD');
 const optNS     = document.getElementById('optNS');
 const optAGC    = document.getElementById('optAGC');
 const optEC     = document.getElementById('optEC');
@@ -69,27 +94,35 @@ let ws = null;
 let ctx = null;
 let micStream = null;
 let worklet = null;
+let preGain = null;
 let currentSource = null;
 let silentSource = null;
 let analyser = null;
 let vuTimer = null;
 let wakeLock = null;
 let statsTimer = null;
+let watchdogTimer = null;
 
 let running = false;
+let muted = false;
 let recovering = false;
+let rebuilding = false;
 let sentBytes = 0;
 let startTime = 0;
+let lastWorkletTime = 0;    // ← reloj del watchdog
 
 const setStatus = (m) => { statusEl.textContent = m; };
+
 function setRunning(on) {
   running = on;
   btn.textContent = on ? 'Detener micrófono' : 'Activar micrófono';
   btn.classList.toggle('stop', on);
   btn.disabled = false;
+  muteBtn.disabled = !on;
+  gainSlider.disabled = !on;
 }
 
-/* ---------------- Wake Lock ---------------- */
+/* ---------- Wake Lock ---------- */
 async function requestWakeLock() {
   if (!('wakeLock' in navigator)) return;
   try {
@@ -101,7 +134,7 @@ async function releaseWakeLock() {
   if (wakeLock) { try { await wakeLock.release(); } catch {} wakeLock = null; }
 }
 
-/* ---------------- Keep-alive silencioso ---------------- */
+/* ---------- Keep-alive silencioso ---------- */
 function startSilentKeepAlive() {
   const buffer = ctx.createBuffer(1, ctx.sampleRate, ctx.sampleRate);
   silentSource = ctx.createBufferSource();
@@ -116,7 +149,7 @@ function stopSilentKeepAlive() {
   if (silentSource) { try { silentSource.stop(); } catch {} silentSource = null; }
 }
 
-/* ---------------- Media Session ---------------- */
+/* ---------- Media Session ---------- */
 function setupMediaSession() {
   if (!('mediaSession' in navigator)) return;
   try {
@@ -124,21 +157,23 @@ function setupMediaSession() {
       title: 'Micrófono remoto activo',
       artist: 'Tu PC',
     });
-    if (typeof navigator.mediaSession.setMicrophoneActive === 'function') {
+    if (typeof navigator.mediaSession.setMicrophoneActive === 'function')
       navigator.mediaSession.setMicrophoneActive(true);
-    }
     navigator.mediaSession.playbackState = 'playing';
   } catch (e) { console.warn('[mediaSession] error:', e); }
 }
 
-/* ---------------- WebSocket ---------------- */
+/* ---------- WebSocket ---------- */
 function connectWS() {
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-  const rate = ctx ? ctx.sampleRate : 48000;
-  ws = new WebSocket(`${proto}://${location.host}/ws?rate=${rate}`);
+  const params = new URLSearchParams({
+    rate: ctx ? ctx.sampleRate : 48000,
+    vad:  optVAD.checked ? '1' : '0',
+    aggr: 2,
+  });
+  ws = new WebSocket(`${proto}://${location.host}/ws?${params}`);
   ws.binaryType = 'arraybuffer';
-
-  ws.onopen = () => { setStatus('Conectado ✅'); };
+  ws.onopen  = () => setStatus('Conectado ✅');
   ws.onclose = () => {
     if (running) {
       setStatus('Reconectando...');
@@ -161,7 +196,7 @@ function sendAudio(float32) {
   sentBytes += i16.byteLength;
 }
 
-/* ---------------- Micrófono ---------------- */
+/* ---------- Micrófono ---------- */
 async function acquireMic() {
   micStream = await navigator.mediaDevices.getUserMedia({
     audio: {
@@ -169,23 +204,25 @@ async function acquireMic() {
       noiseSuppression: optNS.checked,
       autoGainControl:  optAGC.checked,
       channelCount: 1,
-      // NO forzamos sampleRate: dejamos que el AudioContext decida,
-      // así garantizamos que el worklet y el stream del servidor coincidan
     }
   });
-  console.log('[mic] stream adquirido');
 }
 
 function attachMicToWorklet() {
-  if (currentSource) { try { currentSource.disconnect(); } catch {} currentSource = null; }
+  if (currentSource) { try { currentSource.disconnect(); } catch {} }
   currentSource = ctx.createMediaStreamSource(micStream);
-  currentSource.connect(worklet);
+  currentSource.connect(preGain);
+  preGain.connect(worklet);
   if (analyser) { try { currentSource.connect(analyser); } catch {} }
 
   const track = micStream.getAudioTracks()[0];
   if (track) {
+    // Firefox: onmute se dispara al apagar pantalla; onunmute al volver.
+    track.onmute = () => console.warn('[mic] track muted (Firefox quirk)');
+    track.onunmute = () => console.log('[mic] track unmuted');
+
     track.onended = async () => {
-      if (!running || recovering) return;
+      if (!running || recovering || rebuilding) return;
       recovering = true;
       console.warn('[mic] pista finalizada → recuperando...');
       try {
@@ -201,7 +238,105 @@ function attachMicToWorklet() {
   }
 }
 
-/* ---------------- VU ---------------- */
+/* ---------- Rebuild completo (para Firefox al volver de pantalla apagada) ---------- */
+async function rebuildAudioPipeline() {
+  if (!running || rebuilding) return;
+  rebuilding = true;
+  console.log('[rebuild] iniciando reconstrucción del pipeline de audio');
+  setStatus('Reconectando audio...');
+
+  // Guardar estado del usuario
+  const savedMuted = muted;
+  const savedGain  = gainSlider.value / 100;
+
+  // Desmontar pipeline viejo
+  try {
+    const oldTrack = micStream?.getAudioTracks()[0];
+    if (oldTrack) { oldTrack.onended = null; oldTrack.onmute = null; oldTrack.onunmute = null; }
+  } catch {}
+  if (currentSource) { try { currentSource.disconnect(); } catch {} currentSource = null; }
+  if (preGain)       { try { preGain.disconnect(); }       catch {} preGain = null; }
+  if (worklet) {
+    try { worklet.port.onmessage = null; } catch {}
+    try { worklet.disconnect(); } catch {}
+    worklet = null;
+  }
+  if (analyser) { try { analyser.disconnect(); } catch {} analyser = null; }
+  stopSilentKeepAlive();
+  if (micStream) {
+    micStream.getTracks().forEach(t => { try { t.stop(); } catch {} });
+    micStream = null;
+  }
+  if (ctx) {
+    try {
+      await Promise.race([ctx.close(), new Promise(r => setTimeout(r, 600))]);
+    } catch {}
+    ctx = null;
+  }
+
+  if (!running) { rebuilding = false; return; }
+
+  // Reconstruir desde cero
+  try {
+    await acquireMic();
+
+    ctx = new AudioContext({ sampleRate: 48000 });
+    if (ctx.state === 'suspended') await ctx.resume();
+    await ctx.audioWorklet.addModule('/static/mic-processor.js');
+
+    worklet = new AudioWorkletNode(ctx, 'mic-processor', {
+      numberOfInputs: 1, numberOfOutputs: 1, channelCount: 1,
+    });
+
+    preGain = ctx.createGain();
+    preGain.gain.value = savedMuted ? 0 : savedGain;
+
+    const sink = ctx.createGain();
+    sink.gain.value = 0;
+    worklet.connect(sink).connect(ctx.destination);
+
+    analyser = ctx.createAnalyser();
+    analyser.fftSize = 512;
+
+    attachMicToWorklet();
+
+    worklet.port.onmessage = (ev) => {
+      lastWorkletTime = performance.now();
+      sendAudio(ev.data);
+    };
+
+    startSilentKeepAlive();
+    startVU();
+    lastWorkletTime = performance.now();
+
+    // Restaurar estado visual del mute
+    if (savedMuted) {
+      muteBtn.textContent = '🔇';
+      muteBtn.classList.add('muted');
+      vu.classList.add('muted');
+    } else {
+      muteBtn.textContent = '🔊';
+      muteBtn.classList.remove('muted');
+      vu.classList.remove('muted');
+    }
+
+    // Asegurar WS
+    if (!ws || ws.readyState !== WebSocket.OPEN) connectWS();
+
+    // Re-adquirir wake lock
+    await requestWakeLock();
+
+    console.log('[rebuild] pipeline reconstruido ✅');
+    setStatus('Activo ✅');
+  } catch (e) {
+    console.error('[rebuild] fallo:', e);
+    setStatus('Error al reconstruir audio ❌');
+  } finally {
+    rebuilding = false;
+  }
+}
+
+/* ---------- VU ---------- */
 function startVU() {
   if (!analyser) return;
   const buf = new Uint8Array(analyser.fftSize);
@@ -214,7 +349,34 @@ function startVU() {
   }, 60);
 }
 
-/* ---------------- Start / Stop ---------------- */
+/* ---------- Mute / Gain ---------- */
+function applyGain() {
+  if (!preGain) return;
+  const userGain = muted ? 0 : gainSlider.value / 100;
+  preGain.gain.value = userGain;
+  vu.classList.toggle('muted', muted);
+}
+
+muteBtn.addEventListener('click', () => {
+  muted = !muted;
+  muteBtn.textContent = muted ? '🔇' : '🔊';
+  muteBtn.classList.toggle('muted', muted);
+  applyGain();
+});
+
+gainSlider.addEventListener('input', () => {
+  gainVal.textContent = gainSlider.value + '%';
+  applyGain();
+});
+
+/* ---------- VAD hot-toggle ---------- */
+optVAD.addEventListener('change', () => {
+  if (running && ws && ws.readyState === WebSocket.OPEN) {
+    try { ws.close(); } catch {}
+  }
+});
+
+/* ---------- Start / Stop ---------- */
 async function start() {
   btn.disabled = true;
   warnEl.textContent = '';
@@ -233,24 +395,28 @@ async function start() {
 
   if (ctx.sampleRate !== 48000) {
     warnEl.textContent = `⚠️ AudioContext a ${ctx.sampleRate} Hz (no 48000). Puede sonar con pitch alterado.`;
-    console.warn(`[audio] sample rate real: ${ctx.sampleRate}`);
-  } else {
-    console.log(`[audio] sample rate: ${ctx.sampleRate}`);
   }
 
   worklet = new AudioWorkletNode(ctx, 'mic-processor', {
     numberOfInputs: 1, numberOfOutputs: 1, channelCount: 1,
   });
 
-  const mute = ctx.createGain();
-  mute.gain.value = 0;
-  worklet.connect(mute).connect(ctx.destination);
+  preGain = ctx.createGain();
+  preGain.gain.value = gainSlider.value / 100;
+
+  const sink = ctx.createGain();
+  sink.gain.value = 0;
+  worklet.connect(sink).connect(ctx.destination);
 
   analyser = ctx.createAnalyser();
   analyser.fftSize = 512;
 
   attachMicToWorklet();
-  worklet.port.onmessage = (ev) => sendAudio(ev.data);
+  worklet.port.onmessage = (ev) => {
+    lastWorkletTime = performance.now();
+    sendAudio(ev.data);
+  };
+  lastWorkletTime = performance.now();
 
   await requestWakeLock();
   startSilentKeepAlive();
@@ -270,15 +436,31 @@ async function start() {
       `Enviado: ${(sentBytes / 1024).toFixed(1)} KB · ${ratio.toFixed(2)}x tiempo real`;
   }, 1000);
 
+  // Watchdog: si en 2.5 s no llega nada del worklet, reconstruir
+  if (watchdogTimer) clearInterval(watchdogTimer);
+  watchdogTimer = setInterval(() => {
+    if (!running || rebuilding) return;
+    const silenceMs = performance.now() - lastWorkletTime;
+    if (silenceMs > 2500) {
+      console.warn(`[watchdog] pipeline inactivo ${silenceMs.toFixed(0)}ms → rebuild`);
+      rebuildAudioPipeline();
+    }
+  }, 1500);
+
+  muted = false;
+  muteBtn.textContent = '🔊';
+  muteBtn.classList.remove('muted');
+
   setRunning(true);
   setStatus('Activo ✅');
 }
 
 async function stop() {
   running = false;
-  if (statsTimer) { clearInterval(statsTimer); statsTimer = null; }
-  if (vuTimer)    { clearInterval(vuTimer);    vuTimer = null; }
-  if (ws)         { try { ws.close(); } catch {} ws = null; }
+  if (statsTimer)    { clearInterval(statsTimer);    statsTimer = null; }
+  if (vuTimer)       { clearInterval(vuTimer);       vuTimer = null; }
+  if (watchdogTimer) { clearInterval(watchdogTimer); watchdogTimer = null; }
+  if (ws)            { try { ws.close(); } catch {} ws = null; }
   if (currentSource) { try { currentSource.disconnect(); } catch {} currentSource = null; }
   if (micStream) {
     micStream.getTracks().forEach(t => { try { t.stop(); } catch {} });
@@ -287,21 +469,39 @@ async function stop() {
   stopSilentKeepAlive();
   await releaseWakeLock();
   if (ctx) { try { await ctx.close(); } catch {} ctx = null; }
+  preGain = null; worklet = null; analyser = null;
   vu.style.width = '0%';
   statsEl.textContent = '';
   setStatus('Desconectado');
   setRunning(false);
 }
 
-/* ---------------- Ciclo de vida ---------------- */
+/* ---------- Ciclo de vida ---------- */
 document.addEventListener('visibilitychange', async () => {
-  if (!running) return;
+  if (!running || rebuilding) return;
+  console.log('[visibility]', document.visibilityState);
+
   if (document.visibilityState === 'visible') {
-    await requestWakeLock();
-    if (ctx && ctx.state === 'suspended') { try { await ctx.resume(); } catch {} }
-    if (!ws || ws.readyState !== WebSocket.OPEN) connectWS();
+    // Dar un respiro a Firefox para que despierte la página
+    await new Promise(r => setTimeout(r, 400));
+    if (!running || rebuilding) return;
+
+    // ¿El pipeline está vivo? Si no llega audio reciente → rebuild
+    const silenceMs = performance.now() - lastWorkletTime;
+    if (silenceMs > 1000) {
+      console.warn(`[visibility] pipeline muerto (${silenceMs.toFixed(0)}ms sin audio) → rebuild`);
+      await rebuildAudioPipeline();
+    } else {
+      // Intentar resucitar el ctx sin tirar todo
+      if (ctx && ctx.state === 'suspended') {
+        try { await ctx.resume(); } catch {}
+      }
+      await requestWakeLock();
+      if (!ws || ws.readyState !== WebSocket.OPEN) connectWS();
+    }
   }
 });
+
 window.addEventListener('beforeunload', () => {
   if (ws) try { ws.close(); } catch {}
   if (micStream) micStream.getTracks().forEach(t => { try { t.stop(); } catch {} });
