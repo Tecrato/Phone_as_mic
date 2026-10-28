@@ -1,0 +1,313 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<title>Mic → PC</title>
+<style>
+  body { font-family: system-ui, sans-serif; background:#111; color:#eee;
+         display:flex; flex-direction:column; align-items:center;
+         justify-content:center; min-height:100vh; margin:0; text-align:center;
+         padding:1rem; box-sizing:border-box; }
+  h1 { font-size:1.3rem; font-weight:600; margin:.2rem 0; }
+  button { font-size:1.15rem; padding:1rem 2rem; border-radius:999px;
+           border:none; background:#4f9; color:#111; font-weight:700;
+           cursor:pointer; transition: background .2s; margin-top:1rem; }
+  button:disabled { opacity:.4; cursor:default; }
+  button.stop { background:#f66; }
+  #status { margin-top:1rem; opacity:.8; }
+  #vu { width:80%; max-width:340px; height:12px; background:#222;
+        border-radius:6px; overflow:hidden; margin-top:1.5rem; }
+  #vu > div { height:100%; width:0%; background:#4f9;
+              transition: width 60ms linear; }
+  #stats { margin-top:.6rem; font-size:.72rem; opacity:.55; font-family:monospace; }
+  details { margin-top:1.4rem; width:100%; max-width:340px;
+            background:#1a1a1a; border-radius:12px; padding:.6rem .9rem;
+            text-align:left; font-size:.85rem; }
+  details summary { cursor:pointer; opacity:.8; user-select:none; }
+  details label { display:flex; gap:.6rem; align-items:center;
+                  padding:.35rem 0; }
+  details input[type=checkbox] { width:18px; height:18px; }
+  #hint { margin-top:1rem; font-size:.7rem; opacity:.4; max-width:320px; line-height:1.4; }
+  #warn { color:#f77; font-size:.75rem; margin-top:.4rem; min-height:1em; }
+</style>
+</head>
+<body>
+  <h1>🎤 Micrófono remoto</h1>
+  <button id="start">Activar micrófono</button>
+  <div id="status">Desconectado</div>
+  <div id="vu"><div></div></div>
+  <div id="stats"></div>
+  <div id="warn"></div>
+
+  <details>
+    <summary>⚙️ Ajustes de audio</summary>
+    <label><input type="checkbox" id="optNS"> Supresión de ruido (navegador)</label>
+    <label><input type="checkbox" id="optAGC"> Ganancia automática (navegador)</label>
+    <label><input type="checkbox" id="optEC"> Cancelación de eco (navegador)</label>
+    <div style="opacity:.5;font-size:.75rem;margin-top:.5rem">
+      Todos desactivados por defecto. Si tu voz suena metálica o granulada,
+      déjalos así. Si tienes mucho ruido de fondo, prueba activar solo "Supresión".
+    </div>
+  </details>
+
+  <div id="hint">Puedes apagar la pantalla: la transmisión sigue activa en la mayoría de dispositivos.</div>
+
+<script>
+const btn       = document.getElementById('start');
+const statusEl  = document.getElementById('status');
+const vu        = document.querySelector('#vu > div');
+const statsEl   = document.getElementById('stats');
+const warnEl    = document.getElementById('warn');
+const optNS     = document.getElementById('optNS');
+const optAGC    = document.getElementById('optAGC');
+const optEC     = document.getElementById('optEC');
+
+let ws = null;
+let ctx = null;
+let micStream = null;
+let worklet = null;
+let currentSource = null;
+let silentSource = null;
+let analyser = null;
+let vuTimer = null;
+let wakeLock = null;
+let statsTimer = null;
+
+let running = false;
+let recovering = false;
+let sentBytes = 0;
+let startTime = 0;
+
+const setStatus = (m) => { statusEl.textContent = m; };
+function setRunning(on) {
+  running = on;
+  btn.textContent = on ? 'Detener micrófono' : 'Activar micrófono';
+  btn.classList.toggle('stop', on);
+  btn.disabled = false;
+}
+
+/* ---------------- Wake Lock ---------------- */
+async function requestWakeLock() {
+  if (!('wakeLock' in navigator)) return;
+  try {
+    wakeLock = await navigator.wakeLock.request('screen');
+    wakeLock.addEventListener('release', () => console.log('[wakeLock] liberado'));
+  } catch (e) { console.warn('[wakeLock] error:', e); }
+}
+async function releaseWakeLock() {
+  if (wakeLock) { try { await wakeLock.release(); } catch {} wakeLock = null; }
+}
+
+/* ---------------- Keep-alive silencioso ---------------- */
+function startSilentKeepAlive() {
+  const buffer = ctx.createBuffer(1, ctx.sampleRate, ctx.sampleRate);
+  silentSource = ctx.createBufferSource();
+  silentSource.buffer = buffer;
+  silentSource.loop = true;
+  const gain = ctx.createGain();
+  gain.gain.value = 0.001;
+  silentSource.connect(gain).connect(ctx.destination);
+  silentSource.start();
+}
+function stopSilentKeepAlive() {
+  if (silentSource) { try { silentSource.stop(); } catch {} silentSource = null; }
+}
+
+/* ---------------- Media Session ---------------- */
+function setupMediaSession() {
+  if (!('mediaSession' in navigator)) return;
+  try {
+    navigator.mediaSession.metadata = new MediaMetadata({
+      title: 'Micrófono remoto activo',
+      artist: 'Tu PC',
+    });
+    if (typeof navigator.mediaSession.setMicrophoneActive === 'function') {
+      navigator.mediaSession.setMicrophoneActive(true);
+    }
+    navigator.mediaSession.playbackState = 'playing';
+  } catch (e) { console.warn('[mediaSession] error:', e); }
+}
+
+/* ---------------- WebSocket ---------------- */
+function connectWS() {
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  const rate = ctx ? ctx.sampleRate : 48000;
+  ws = new WebSocket(`${proto}://${location.host}/ws?rate=${rate}`);
+  ws.binaryType = 'arraybuffer';
+
+  ws.onopen = () => { setStatus('Conectado ✅'); };
+  ws.onclose = () => {
+    if (running) {
+      setStatus('Reconectando...');
+      setTimeout(() => { if (running) connectWS(); }, 1500);
+    } else {
+      setStatus('Desconectado');
+    }
+  };
+  ws.onerror = () => console.warn('[ws] error');
+}
+
+function sendAudio(float32) {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+  const i16 = new Int16Array(float32.length);
+  for (let i = 0; i < float32.length; i++) {
+    const s = Math.max(-1, Math.min(1, float32[i]));
+    i16[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+  }
+  ws.send(i16.buffer);
+  sentBytes += i16.byteLength;
+}
+
+/* ---------------- Micrófono ---------------- */
+async function acquireMic() {
+  micStream = await navigator.mediaDevices.getUserMedia({
+    audio: {
+      echoCancellation: optEC.checked,
+      noiseSuppression: optNS.checked,
+      autoGainControl:  optAGC.checked,
+      channelCount: 1,
+      // NO forzamos sampleRate: dejamos que el AudioContext decida,
+      // así garantizamos que el worklet y el stream del servidor coincidan
+    }
+  });
+  console.log('[mic] stream adquirido');
+}
+
+function attachMicToWorklet() {
+  if (currentSource) { try { currentSource.disconnect(); } catch {} currentSource = null; }
+  currentSource = ctx.createMediaStreamSource(micStream);
+  currentSource.connect(worklet);
+  if (analyser) { try { currentSource.connect(analyser); } catch {} }
+
+  const track = micStream.getAudioTracks()[0];
+  if (track) {
+    track.onended = async () => {
+      if (!running || recovering) return;
+      recovering = true;
+      console.warn('[mic] pista finalizada → recuperando...');
+      try {
+        await acquireMic();
+        attachMicToWorklet();
+        await requestWakeLock();
+        setStatus('Conectado ✅');
+      } catch (e) {
+        console.error('[mic] no se pudo recuperar:', e);
+        setStatus('Micrófono perdido ❌');
+      } finally { recovering = false; }
+    };
+  }
+}
+
+/* ---------------- VU ---------------- */
+function startVU() {
+  if (!analyser) return;
+  const buf = new Uint8Array(analyser.fftSize);
+  if (vuTimer) clearInterval(vuTimer);
+  vuTimer = setInterval(() => {
+    analyser.getByteTimeDomainData(buf);
+    let peak = 0;
+    for (const v of buf) peak = Math.max(peak, Math.abs(v - 128));
+    vu.style.width = Math.min(100, (peak / 128) * 100) + '%';
+  }, 60);
+}
+
+/* ---------------- Start / Stop ---------------- */
+async function start() {
+  btn.disabled = true;
+  warnEl.textContent = '';
+  setStatus('Pidiendo permiso...');
+
+  try { await acquireMic(); }
+  catch (e) {
+    setStatus('Permiso denegado: ' + e.message);
+    btn.disabled = false;
+    return;
+  }
+
+  ctx = new AudioContext({ sampleRate: 48000 });
+  if (ctx.state === 'suspended') await ctx.resume();
+  await ctx.audioWorklet.addModule('/static/mic-processor.js');
+
+  if (ctx.sampleRate !== 48000) {
+    warnEl.textContent = `⚠️ AudioContext a ${ctx.sampleRate} Hz (no 48000). Puede sonar con pitch alterado.`;
+    console.warn(`[audio] sample rate real: ${ctx.sampleRate}`);
+  } else {
+    console.log(`[audio] sample rate: ${ctx.sampleRate}`);
+  }
+
+  worklet = new AudioWorkletNode(ctx, 'mic-processor', {
+    numberOfInputs: 1, numberOfOutputs: 1, channelCount: 1,
+  });
+
+  const mute = ctx.createGain();
+  mute.gain.value = 0;
+  worklet.connect(mute).connect(ctx.destination);
+
+  analyser = ctx.createAnalyser();
+  analyser.fftSize = 512;
+
+  attachMicToWorklet();
+  worklet.port.onmessage = (ev) => sendAudio(ev.data);
+
+  await requestWakeLock();
+  startSilentKeepAlive();
+  setupMediaSession();
+
+  connectWS();
+  startVU();
+
+  startTime = Date.now();
+  sentBytes = 0;
+  if (statsTimer) clearInterval(statsTimer);
+  statsTimer = setInterval(() => {
+    if (!running) return;
+    const secs = Math.max(0.001, (Date.now() - startTime) / 1000);
+    const ratio = (sentBytes / 2 / 48000) / secs;
+    statsEl.textContent =
+      `Enviado: ${(sentBytes / 1024).toFixed(1)} KB · ${ratio.toFixed(2)}x tiempo real`;
+  }, 1000);
+
+  setRunning(true);
+  setStatus('Activo ✅');
+}
+
+async function stop() {
+  running = false;
+  if (statsTimer) { clearInterval(statsTimer); statsTimer = null; }
+  if (vuTimer)    { clearInterval(vuTimer);    vuTimer = null; }
+  if (ws)         { try { ws.close(); } catch {} ws = null; }
+  if (currentSource) { try { currentSource.disconnect(); } catch {} currentSource = null; }
+  if (micStream) {
+    micStream.getTracks().forEach(t => { try { t.stop(); } catch {} });
+    micStream = null;
+  }
+  stopSilentKeepAlive();
+  await releaseWakeLock();
+  if (ctx) { try { await ctx.close(); } catch {} ctx = null; }
+  vu.style.width = '0%';
+  statsEl.textContent = '';
+  setStatus('Desconectado');
+  setRunning(false);
+}
+
+/* ---------------- Ciclo de vida ---------------- */
+document.addEventListener('visibilitychange', async () => {
+  if (!running) return;
+  if (document.visibilityState === 'visible') {
+    await requestWakeLock();
+    if (ctx && ctx.state === 'suspended') { try { await ctx.resume(); } catch {} }
+    if (!ws || ws.readyState !== WebSocket.OPEN) connectWS();
+  }
+});
+window.addEventListener('beforeunload', () => {
+  if (ws) try { ws.close(); } catch {}
+  if (micStream) micStream.getTracks().forEach(t => { try { t.stop(); } catch {} });
+});
+
+btn.addEventListener('click', () => { running ? stop() : start(); });
+</script>
+</body>
+</html>
